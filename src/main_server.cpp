@@ -140,7 +140,7 @@ void sendDataTask(void* pvParameters) {
 }
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(400000);
     Wire.begin();
     Wire.setClock(1000000);  // Set I2C clock to 1MHz for fast reads
 

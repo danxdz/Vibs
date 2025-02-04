@@ -82,6 +82,9 @@ def update_plot(frame):
         
         # Split batch samples from UDP packet
         batch = data.decode().strip().split("\n")
+
+        #print received data
+        print(batch)
         
         for sample in batch:
             values = [int(x) for x in sample.split(',')]
