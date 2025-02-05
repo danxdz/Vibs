@@ -3,7 +3,6 @@
 #include <WiFi.h>
 #include <WiFiUDP.h>
 
-
 // MPU6050 settings
 const int MPU_ADDR = 0x68;
 int16_t AcX, AcY, AcZ, GyX, GyY, GyZ;
@@ -41,9 +40,10 @@ void setupMPU6050() {
     Wire.write(0x08);  // ±500 deg/sec
     Wire.endTransmission(true);
 
+    // Set sample rate divider for approximately 400Hz
     Wire.beginTransmission(MPU_ADDR);
     Wire.write(0x19);  // Sample Rate Divider
-    Wire.write(0x00);  // 1kHz sampling (SMPRT_DIV = 0)
+    Wire.write(0x04);  // 400Hz sampling (SMPRT_DIV = 4)
     Wire.endTransmission(true);
 }
 

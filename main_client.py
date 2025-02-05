@@ -7,6 +7,16 @@ import os
 import wave
 import matplotlib.pyplot as plt
 
+import scipy.io.wavfile as wav
+import sounddevice as sd
+
+from client_fft import DataHandler
+
+
+
+
+# Default sample rate (adjust as needed)
+DEFAULT_SAMPLE_RATE = 16000 
 # Constants
 ESP_PORT = 12345
 CALIBRATION_SAMPLES = 200
@@ -26,6 +36,8 @@ last_timestamp = None
 collected_data = []
 stop_thread = False
 capture_data = False
+
+
 
 # UDP Socket Setup
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -95,6 +107,12 @@ def save_to_csv(filename):
     with open(filename, "w", newline="") as file:
         writer = csv.writer(file)
         writer.writerows(collected_data)
+       
+        dh = DataHandler(filename)
+
+        # Run the analysis (this will load the data, apply filters, and generate plots)
+        dh.run_analysis()
+
 
 def save_wav(filename, data):
     try:
@@ -167,7 +185,7 @@ def generate_plots(session_folder, session_name):
         plt.close()
         print(f"✅ {label}-axis Plot saved to {plot_filename}")
 
-def save_data_as_wav(session_folder, session_name):
+def save_data_as_wav_(session_folder, session_name):
     if len(collected_data) == 0:
         print("⚠️ No data to save as WAV.")
         return
@@ -185,6 +203,52 @@ def save_data_as_wav(session_folder, session_name):
         axis_data = np.int16(data[:, i] / np.max(np.abs(data[:, i])) * 32767)
         wav_filename = os.path.join(session_folder, f"{session_name}_{label}_gyro_data.wav")
         save_wav(wav_filename, axis_data)
+
+import os
+import numpy as np
+import scipy.io.wavfile as wav
+import sounddevice as sd
+
+# Default sample rate (adjust as needed)
+DEFAULT_SAMPLE_RATE = 16000  
+
+def save_wav(filename, data, sample_rate=DEFAULT_SAMPLE_RATE):
+    """Saves normalized vibration data as a WAV file."""
+    wav.write(filename, sample_rate, data)
+    print(f"🎵 Saved: {filename}")
+
+def save_data_as_wav(session_folder, session_name):
+    """Saves collected vibration data as WAV files and optionally plays the sound."""
+    if len(collected_data) == 0:
+        print("⚠️ No data to save as WAV.")
+        return
+
+    # Convert data to numpy array
+    data = np.array(collected_data)
+
+    # Ensure no zero max values to avoid division errors
+    max_val = np.max(np.abs(data), axis=0)
+    max_val[max_val == 0] = 1  # Avoid division by zero
+
+    # Save combined WAV (All axes merged)
+    data_normalized = np.int16(data.flatten() / np.max(max_val) * 32767)
+    wav_filename = os.path.join(session_folder, f"{session_name}_gyro_data.wav")
+    save_wav(wav_filename, data_normalized, DEFAULT_SAMPLE_RATE)
+
+    # Save individual WAV files for each axis
+    for i, label in enumerate(["X", "Y", "Z"]):
+        axis_data = np.int16(data[:, i] / max_val[i] * 32767)
+        wav_filename = os.path.join(session_folder, f"{session_name}_{label}_gyro_data.wav")
+        save_wav(wav_filename, axis_data, DEFAULT_SAMPLE_RATE)
+
+        # Optional: Play audio for each axis
+    
+        print(f"🎧 Playing {label}-axis vibration sound...")
+        sd.play(axis_data, DEFAULT_SAMPLE_RATE)
+        sd.wait()
+
+    print("✅ WAV files saved successfully!")
+
 
 # Main Program Logic
 if __name__ == "__main__":
@@ -218,7 +282,13 @@ if __name__ == "__main__":
                 generate_plots(session_folder, session_name)
                 save_data_as_wav(session_folder, session_name)  # Save as WAV
                 print(f"🎉 Data capture stopped and saved as {session_name}!")
+                capture_data = None
             else:
+                # check if connected
+                if connection_status == "🔴 Disconnected":
+                    print("🔴 Disconnected. Press Enter to start data capture.")
+                    continue
+                
                 start_data_capture()
 
     except KeyboardInterrupt:
