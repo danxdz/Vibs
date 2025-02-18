@@ -1,0 +1,54 @@
+#include <Arduino.h>
+
+const int motorPin = 3;  // Motor PWM pin
+const int minSpeed = 75;
+const int maxSpeed = 255;
+int Speed = minSpeed;     // Default start speed
+bool manualControl = false; // Flag for manual mode
+
+void waitForStart() {
+  Serial.println("Press any key to start or wait 10 seconds...");
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < 10000) { // Wait for 10 seconds
+    if (Serial.available() > 0) { // If user sends input
+      Serial.read();  // Clear the buffer
+      Serial.println("Starting...");
+      return;
+    }
+  }
+  Serial.println("Auto-starting...");
+}
+
+void rampSpeed() {
+  // Ramp Up: Increase speed by 10% every 5 seconds
+  for (int i = minSpeed; i <= maxSpeed; i += 20) {
+    analogWrite(motorPin, i);
+    Serial.print("Ramping up: ");
+    Serial.println(i);
+    delay(5000);  // 5 seconds per step
+  }
+
+  // Ramp Down: Decrease speed by 10% every 5 seconds
+  for (int i = maxSpeed; i >= minSpeed; i -= 20) {
+    analogWrite(motorPin, i);
+    Serial.print("Ramping down: ");
+    Serial.println(i);
+    delay(5000);  // 5 seconds per step
+  }
+}
+
+void setup() {
+  pinMode(motorPin, OUTPUT);
+  Serial.begin(115200);
+}
+
+void loop() {
+  waitForStart();  // Wait for 10s or key press before starting
+
+  if (!manualControl) {
+    rampSpeed();
+  } else {
+    analogWrite(motorPin, Speed); // Maintain manual speed
+  }
+}

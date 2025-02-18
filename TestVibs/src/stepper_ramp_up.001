@@ -1,0 +1,54 @@
+#include <Arduino.h>
+#include "Stepper.h"
+
+// Define number of steps per revolution:
+const int stepsPerRevolution = 2048;
+
+// Define stepper motor control pins (ULN2003 driver)
+Stepper myStepper = Stepper(stepsPerRevolution, 8, 10, 9, 11);
+
+void setup() {
+  Serial.begin(115200);
+}
+
+void loop() {
+  // Gradually increase speed from 1 to 10 RPM
+  for (int rpm = 1; rpm <= 10; rpm++) {
+    myStepper.setSpeed(rpm);
+    Serial.print("Speed: ");
+    Serial.print(rpm);
+    Serial.println(" RPM (clockwise)");
+
+    unsigned long startTime = millis();
+    while (millis() - startTime < 5000) { // Run for 5 seconds
+      myStepper.step(stepsPerRevolution / 10); // Partial revolution to keep motion smooth
+    }
+  }
+
+  // Hold at 10 RPM for 5 seconds
+  myStepper.setSpeed(10);
+  Serial.println("Holding at 10 RPM (clockwise)");
+  unsigned long holdTime = millis();
+  while (millis() - holdTime < 5000) {
+    myStepper.step(stepsPerRevolution / 10);
+  }
+
+  // Gradually decrease speed from 10 to 1 RPM
+  for (int rpm = 10; rpm >= 1; rpm--) {
+    myStepper.setSpeed(rpm);
+    Serial.print("Speed: ");
+    Serial.print(rpm);
+    Serial.println(" RPM (counterclockwise)");
+
+    unsigned long startTime = millis();
+    while (millis() - startTime < 5000) { // Run for 5 seconds
+      //myStepper.step(-stepsPerRevolution / 10); CCW
+      myStepper.step(stepsPerRevolution / 10); // CW
+
+    }
+  }
+
+  // Pause for 5 seconds before restarting the cycle
+  Serial.println("Pausing for 5 seconds...");
+  delay(5000);
+}

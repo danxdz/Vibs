@@ -1,0 +1,170 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <WebSocketsServer.h>
+
+// Wi-Fi Hotspot Credentials
+const char* SSID = "Vibs_Hotspot";
+const char* PASSWORD = "Vibs123456";
+
+// WebSocket Server (Port 81)
+WebSocketsServer webSocket(81);
+
+// MPU6050 I2C Address
+#define MPU6050_ADDR 0x68
+
+// Sensor Data Variables (Shared Between Threads)
+volatile int16_t AcX, AcY, AcZ, GyX, GyY, GyZ;
+volatile uint32_t timestamp;
+
+// Task Handles
+TaskHandle_t SensorTask;
+TaskHandle_t WebSocketTask;
+
+// Mutex for Thread Safety
+SemaphoreHandle_t sensorMutex;
+
+// Setup Wi-Fi Access Point
+void setupWiFi() {
+    WiFi.softAP(SSID, PASSWORD);
+    Serial.print("WiFi AP Started. Connect to: ");
+    Serial.println(SSID);
+}
+
+// Setup MPU6050
+void setupMPU6050() {
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x6B);  // Power management register
+    Wire.write(0x01);  // Wake up & set clock source
+    Wire.endTransmission(true);
+
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x1A);  // Config register
+    Wire.write(0x00);  // No DLPF, max bandwidth
+    Wire.endTransmission(true);
+
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x1B);  // Gyroscope config
+    Wire.write(0x08);  // ±500 deg/sec
+    Wire.endTransmission(true);
+
+    /*
+    0x00 → ±2g
+    0x08 → ±4g
+    0x10 → ±8g
+    0x18 → ±16g
+    🚀 Best Practice
+    ±2g or ±4g for precise motion detection (vibration, tilts).
+    ±8g or ±16g for high-impact motion (fast movements, shocks).
+    */
+
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x1C);  // Accelerometer config
+    Wire.write(0x08);  // ±4g range (8,192 LSB/g) 
+    Wire.endTransmission(true);
+
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x19);  // Sample Rate Divider
+    Wire.write(0x00);  // 1kHz sampling (SMPRT_DIV = 0)
+    Wire.endTransmission(true);
+}
+
+
+// Read MPU6050 Data (Runs on a Separate Core)
+void readMPU6050Task(void* parameter) {
+    while (true) {
+        if (xSemaphoreTake(sensorMutex, portMAX_DELAY) == pdTRUE) {
+            Wire.beginTransmission(MPU6050_ADDR);
+            Wire.write(0x3B);  // Start with AccX High Byte
+            Wire.endTransmission(false);
+            Wire.requestFrom((uint8_t)MPU6050_ADDR, (size_t)14, (bool)true);
+
+
+            AcX = (Wire.read() << 8) | Wire.read();
+            AcY = (Wire.read() << 8) | Wire.read();
+            AcZ = (Wire.read() << 8) | Wire.read();
+            Wire.read(); Wire.read(); // Skip temperature
+            GyX = (Wire.read() << 8) | Wire.read();
+            GyY = (Wire.read() << 8) | Wire.read();
+            GyZ = (Wire.read() << 8) | Wire.read();
+            timestamp = micros(); // Timestamp in microseconds
+
+            xSemaphoreGive(sensorMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));  // 5ms delay (~200Hz)
+    }
+}
+
+// WebSocket Event Handler
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+    if (type == WStype_CONNECTED) {
+        Serial.printf("Client %u connected\n", num);
+    } else if (type == WStype_DISCONNECTED) {
+        Serial.printf("Client %u disconnected\n", num);
+    }
+}
+
+// Send Sensor Data via WebSocket (Runs on a Separate Core)
+void sendSensorDataTask(void* parameter) {
+    uint8_t buffer[16];  // 16-byte packet format: <hhhhhhI>
+    
+    while (true) {
+        if (xSemaphoreTake(sensorMutex, portMAX_DELAY) == pdTRUE) {
+            memcpy(buffer, (const void*)&GyX, 2);
+            memcpy(buffer + 2, (const void*)&GyY, 2);
+            memcpy(buffer + 4, (const void*)&GyZ, 2);
+            memcpy(buffer + 6, (const void*)&AcX, 2);
+            memcpy(buffer + 8, (const void*)&AcY, 2);
+            memcpy(buffer + 10, (const void*)&AcZ, 2);
+            memcpy(buffer + 12, (const void*)&timestamp, 4);
+
+
+            xSemaphoreGive(sensorMutex);
+        }
+
+        webSocket.broadcastBIN(buffer, sizeof(buffer));
+        vTaskDelay(pdMS_TO_TICKS(1));  // 5ms delay (~200Hz)
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    setupWiFi();
+
+    Wire.begin();
+    Wire.setClock(1000000);  // Set I2C clock to 1MHz for fast reads
+    setupMPU6050();
+
+    // Initialize WebSocket
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+
+    // Create Mutex for Data Protection
+    sensorMutex = xSemaphoreCreateMutex();
+
+    // Create Sensor Reading Task on Core 0
+    xTaskCreatePinnedToCore(
+        readMPU6050Task,   // Task function
+        "SensorTask",      // Task name
+        2048,              // Stack size
+        NULL,              // Task parameters
+        2,                 // Priority (Higher than WebSocket)
+        &SensorTask,       // Task handle
+        0                  // Run on Core 0
+    );
+
+    // Create WebSocket Sending Task on Core 1
+    xTaskCreatePinnedToCore(
+        sendSensorDataTask,  // Task function
+        "WebSocketTask",     // Task name
+        2048,                // Stack size
+        NULL,                // Task parameters
+        1,                   // Priority (Lower than Sensor Task)
+        &WebSocketTask,      // Task handle
+        1                    // Run on Core 1
+    );
+}
+
+void loop() {
+    webSocket.loop();  // Process WebSocket Events
+}

@@ -1,0 +1,148 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <freertos/semphr.h>  // FreeRTOS semaphore
+
+// Create MPU6050 object
+Adafruit_MPU6050 mpu;
+
+// Hotspot credentials
+const char* hotspot_ssid = "Vibs_Hotspot";
+const char* hotspot_password = "Vibs123456";
+
+// TCP settings
+WiFiServer server(12345);
+WiFiClient client;
+
+// Sensor data buffer
+uint8_t dataBuffer[16];  // 6 * 2 (GyX, GyY, GyZ, AcX, AcY, AcZ) + 4 (timestamp)
+
+// IMU sensor data
+int16_t AcX, AcY, AcZ, GyX, GyY, GyZ;
+
+// Mutex for I2C access
+SemaphoreHandle_t i2cMutex;
+
+// CPS Counter Variables
+volatile uint32_t captureCount = 0;
+uint32_t lastReportTime = 0;  // Track last report time
+
+void setupMPU6050() {
+    if (!mpu.begin()) {
+        Serial.println("❌ MPU6050 initialization failed!");
+        while (1);  // Halt execution
+    }
+    Serial.println("✅ MPU6050 Ready");
+    /*
+    MPU6050 Filter	        Cutoff Frequency	Use Case
+    MPU6050_BAND_260_HZ	    260 Hz	            Best for detecting fast vibrations (CNC tools, motors)
+    MPU6050_BAND_184_HZ	    184 Hz	            Good balance: reduces noise but captures useful vibration
+    MPU6050_BAND_94_HZ	    94 Hz	            Reduces noise further but still captures motor vibrations
+    MPU6050_BAND_21_HZ	    21 Hz	            Good for slow motion tracking but may filter out useful vibrations
+
+    Accelerometer Range	    Max G-force	    Sensitivity (LSB/G)	    Use Case
+    MPU6050_RANGE_2_G	    ±2G	            16,384 LSB/G	        Best for small vibrations, high sensitivity
+    MPU6050_RANGE_4_G	    ±4G	            8,192 LSB/G	            Balanced, detects medium vibrations
+    MPU6050_RANGE_8_G	    ±8G	            4,096 LSB/G	            Good for high-vibration motors
+    MPU6050_RANGE_16_G	    ±16G	        2,048 LSB/G	            Best for very strong impacts, but lower sensitivity
+
+    Gyroscope Range	        Max Rotation (°/s)	Sensitivity (LSB/°/s)	Use Case
+    MPU6050_RANGE_250_DEG	±250°/s	            131.0	                Highest sensitivity (slow movements, small vibrations)
+    MPU6050_RANGE_500_DEG	±500°/s	            65.5	                Balanced, good for general vibration analysis
+    MPU6050_RANGE_1000_DEG	±1000°/s	        32.8	                Good for fast-spinning parts, higher vibration
+    MPU6050_RANGE_2000_DEG	±2000°/s	        16.4	                For very high-speed rotating parts (but less precision)
+    */  
+     
+    // Configure accelerometer and gyroscope
+    mpu.setAccelerometerRange(MPU6050_RANGE_2_G);  // Highest sensitivity for small vibrations
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);       // Highest sensitivity for slow/small rotations
+    mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);   // Captures high-frequency vibrations
+}
+
+void readMPU6050() {
+    if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {  // Ensure only one task accesses I2C
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
+
+        // Convert to int16_t
+        AcX = (int16_t)(a.acceleration.x * 1000);  // Convert to mg
+        AcY = (int16_t)(a.acceleration.y * 1000);
+        AcZ = (int16_t)(a.acceleration.z * 1000);
+        GyX = (int16_t)(g.gyro.x * 1000);          // Convert to mdeg/s
+        GyY = (int16_t)(g.gyro.y * 1000);
+        GyZ = (int16_t)(g.gyro.z * 1000);
+
+        xSemaphoreGive(i2cMutex);  // Release mutex
+        // Increase capture count
+        captureCount++;
+    }
+}
+
+void IRAM_ATTR sendData() {
+    if (client && client.connected()) {
+        readMPU6050();  // Now safely protected by the mutex
+
+        memcpy(dataBuffer, &GyX, sizeof(GyX));
+        memcpy(dataBuffer + 2, &GyY, sizeof(GyY));
+        memcpy(dataBuffer + 4, &GyZ, sizeof(GyZ));
+        memcpy(dataBuffer + 6, &AcX, sizeof(AcX));
+        memcpy(dataBuffer + 8, &AcY, sizeof(AcY));
+        memcpy(dataBuffer + 10, &AcZ, sizeof(AcZ));
+
+        uint32_t timestamp = micros();
+        memcpy(dataBuffer + 12, &timestamp, sizeof(timestamp));
+
+        client.write(dataBuffer, 16);
+
+
+    }
+}
+
+void networkTask(void *pvParameters) {
+    while (1) {
+        if (!client || !client.connected()) {
+            client = server.available();
+            if (client) Serial.println("✅ Client connected.");
+        } else {
+            sendData();
+        }
+
+        // Print CPS every 3 seconds
+        uint32_t currentTime = millis();
+        if (currentTime - lastReportTime >= 3000) {  // 3 seconds
+            Serial.printf("📊 Captures per second (CPS): %d\n", captureCount / 3);
+            captureCount = 0;  // Reset count
+            lastReportTime = currentTime;
+        }
+
+        vTaskDelay(1 / portTICK_PERIOD_MS);  // Increase delay to reduce CPU load
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+    Wire.setClock(1000000);
+    Wire.setTimeout(1000);  // Increase I2C timeout
+
+    WiFi.softAP(hotspot_ssid, hotspot_password);
+    Serial.println("🛜 Hotspot active");
+    Serial.println(WiFi.softAPIP());
+
+    server.begin();
+    Serial.println("📡 TCP Server started.");
+
+    setupMPU6050();
+
+    // Create I2C mutex
+    i2cMutex = xSemaphoreCreateMutex();
+
+    // Run network task on Core 1
+    xTaskCreatePinnedToCore(networkTask, "NetworkTask", 4096, NULL, 1, NULL, 1);
+}
+
+void loop() {
+    vTaskDelay(1 / portTICK_PERIOD_MS);  // Keep the main loop alive but doing nothing
+}

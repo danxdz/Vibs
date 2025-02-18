@@ -1,0 +1,194 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/event_groups.h>
+
+
+#define PACKET_BATCH_SIZE 8  // Send 8 packets at once
+#define PACKET_SIZE 16
+
+
+// MPU6050 settings
+const int MPU_ADDR = 0x68;
+int16_t AcX, AcY, AcZ, GyX, GyY, GyZ;
+
+// WiFi Hotspot credentials
+const char* hotspot_ssid = "Vibs_Hotspot";
+const char* hotspot_password = "Vibs123456";
+
+// TCP Server settings
+WiFiServer server(12345);
+WiFiClient client;
+
+// Data Buffer (16 bytes: sensor data + timestamp)
+uint8_t dataBuffer[16];
+QueueHandle_t sensorQueue;
+
+// Performance tracking
+uint32_t packetCount = 0;
+uint32_t totalBytes = 0;
+uint32_t startTime = 0;
+
+// FreeRTOS Event Group for Client Connection Management
+EventGroupHandle_t eventGroup;
+const int CLIENT_CONNECTED_BIT = BIT0;
+
+// Function to configure MPU6050
+void setupMPU6050() {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x6B);  
+    Wire.write(0x01);  // Wake up MPU6050 & set clock source
+    Wire.endTransmission(true);
+
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x1A);
+    Wire.write(0x00);  // Disable DLPF for max speed
+    Wire.endTransmission(true);
+
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x1B);
+    Wire.write(0x08);  // ±250 deg/sec (best resolution)
+    Wire.endTransmission(true);
+
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x19);
+    Wire.write(0x00);  // 1kHz sample rate
+    Wire.endTransmission(true);
+
+    // Enable FIFO
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x6A);
+    Wire.write(0x40);  // Enable FIFO
+    Wire.endTransmission(true);
+
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x23);
+    Wire.write(0x78);  // Store Gyro & Accel in FIFO
+    Wire.endTransmission(true);
+}
+
+
+// Optimized MPU6050 read function (Burst Read)
+void IRAM_ATTR readMPU6050() {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x72);  // FIFO_COUNT_H register
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 2, true);
+
+    int16_t fifoCount = (Wire.read() << 8) | Wire.read();  // Get FIFO byte count
+
+    if (fifoCount < 14) {  // **Ensure at least one full packet is available**
+        return;
+    }
+
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x74);  // FIFO_R_W register
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, 14, true);
+
+    AcX = (Wire.read() << 8) | Wire.read();
+    AcY = (Wire.read() << 8) | Wire.read();
+    AcZ = (Wire.read() << 8) | Wire.read();
+    Wire.read(); Wire.read();  // Skip temperature
+    GyX = (Wire.read() << 8) | Wire.read();
+    GyY = (Wire.read() << 8) | Wire.read();
+    GyZ = (Wire.read() << 8) | Wire.read();
+}
+
+
+
+// Sensor reading task (Core 0)
+void IRAM_ATTR sensorTask(void *pvParameters) {
+    int16_t sensorData[6];
+    while (1) {
+        readMPU6050();
+        sensorData[0] = GyX; sensorData[1] = GyY; sensorData[2] = GyZ;
+        sensorData[3] = AcX; sensorData[4] = AcY; sensorData[5] = AcZ;
+        xQueueSend(sensorQueue, sensorData, 0);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+// Network handling task (Core 1)
+
+void IRAM_ATTR networkTask(void *pvParameters) {
+    int16_t sensorData[6];
+    uint8_t batchBuffer[PACKET_BATCH_SIZE * PACKET_SIZE];  // Buffer for batch sending
+    int batchIndex = 0;
+
+    startTime = millis();
+    
+    while (1) {
+        if (!client || !client.connected()) {
+            client = server.available();
+            if (client) {
+                Serial.println("✅ Client connected.");
+                packetCount = 0;
+                totalBytes = 0;
+                startTime = millis();
+            }
+        } else if (xQueueReceive(sensorQueue, sensorData, portMAX_DELAY)) {
+            uint32_t timestamp = micros();
+
+            memcpy(batchBuffer + (batchIndex * PACKET_SIZE), sensorData, sizeof(sensorData));  // 12 bytes
+            memcpy(batchBuffer + (batchIndex * PACKET_SIZE) + 12, &timestamp, sizeof(timestamp));  // 4 bytes
+
+            batchIndex++;
+
+            if (batchIndex >= PACKET_BATCH_SIZE) {
+                client.write(batchBuffer, batchIndex * PACKET_SIZE);  // Send full batch
+                batchIndex = 0;  // Reset index
+            }
+        }
+
+        // Ensure any leftover packets are sent immediately
+        if (batchIndex > 0 && millis() - startTime > 10) {  // Avoid delays
+            client.write(batchBuffer, batchIndex * PACKET_SIZE);
+            batchIndex = 0;
+        }
+
+        // Update statistics
+        packetCount++;
+        totalBytes += PACKET_SIZE;
+
+        // Print performance stats every 3 seconds
+        uint32_t elapsed = millis() - startTime;
+        if (elapsed >= 3000) {
+            float pps = (float)packetCount / (elapsed / 1000.0);
+            float dataRate = (totalBytes * 8.0) / (elapsed / 1000.0) / 1000.0;  // kbps
+
+            packetCount = 0;
+            totalBytes = 0;
+            startTime = millis();
+        }
+    }
+}
+
+
+
+void setup() {
+    
+    Wire.begin();
+    Wire.setClock(1000000);  // 2MHz I2C Clock for faster reads
+
+    WiFi.softAP(hotspot_ssid, hotspot_password);
+    //WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Max transmission power
+    WiFi.setSleep(false);  // Disable Wi-Fi power save mode
+
+    server.begin();
+
+    setupMPU6050();
+
+    sensorQueue = xQueueCreate(100, sizeof(int16_t) * 6);
+    eventGroup = xEventGroupCreate();
+
+    xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(networkTask, "NetworkTask", 4096, NULL, -1, NULL, 1);
+}
+
+void loop() {
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+
